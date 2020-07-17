@@ -1,5 +1,6 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE TypeApplications #-}
@@ -18,31 +19,40 @@ module Test.Shelley.Spec.Ledger.BenchmarkFunctions
     ledgerStateWithNregisteredPools, -- How to precompute env for the Stake Pool transactions
     ledgerDelegateManyKeysOnePool,
     ledgerStateWithNkeysMpools, -- How to precompute env for the Stake Delegation transactions
+    makeRewardParams,
+    runRewards,
   )
 where
 
 import Cardano.Crypto.Hash.Blake2b (Blake2b_256)
+import Cardano.Slotting.Slot (EpochSize (..))
 import Control.State.Transition.Extended (TRC (..), applySTS)
+import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Sequence.Strict (StrictSeq)
 import qualified Data.Sequence.Strict as StrictSeq
 import qualified Data.Set as Set
+import Data.Set (Set)
 import Data.Word (Word64)
 import Numeric.Natural (Natural)
 import Shelley.Spec.Ledger.BaseTypes
-  ( Network (..),
+  ( ActiveSlotCoeff,
+    Network (..),
     StrictMaybe (..),
+    mkActiveSlotCoeff,
   )
 import Shelley.Spec.Ledger.Coin (Coin (..))
-import Shelley.Spec.Ledger.Credential (pattern KeyHashObj)
+import Shelley.Spec.Ledger.Credential (Credential (..), pattern KeyHashObj)
 import Shelley.Spec.Ledger.Delegation.Certificates
   ( pattern DeRegKey,
     pattern Delegate,
     pattern RegKey,
   )
+import Shelley.Spec.Ledger.EpochBoundary (BlocksMade (..), Stake (..))
 import Shelley.Spec.Ledger.Hashing (hashAnnotated)
 import Shelley.Spec.Ledger.Keys
-  ( KeyRole (..),
+  ( KeyHash,
+    KeyRole (..),
     asWitness,
     hashKey,
     vKey,
@@ -54,12 +64,14 @@ import Shelley.Spec.Ledger.LedgerState
     pattern UTxOState,
   )
 import Shelley.Spec.Ledger.PParams (PParams, PParams' (..))
+import Shelley.Spec.Ledger.Rewards (Likelihood, reward)
 import Shelley.Spec.Ledger.STS.Ledger (pattern LedgerEnv)
 import Shelley.Spec.Ledger.Slot (EpochNo (..), SlotNo (..))
 import Shelley.Spec.Ledger.Tx (WitnessSetHKD (..), pattern Tx)
 import Shelley.Spec.Ledger.TxData
   ( Delegation (..),
     PoolCert (..),
+    PoolParams (..),
     _poolCost,
     _poolMD,
     _poolMargin,
@@ -71,7 +83,6 @@ import Shelley.Spec.Ledger.TxData
     _poolVrf,
     pattern DCertDeleg,
     pattern DCertPool,
-    pattern PoolParams,
     pattern RewardAcnt,
     pattern TxBody,
     pattern TxIn,
@@ -81,14 +92,12 @@ import Shelley.Spec.Ledger.TxData
 import Shelley.Spec.Ledger.UTxO (makeWitnessesVKey)
 import Test.Shelley.Spec.Ledger.ConcreteCryptoTypes
   ( Addr,
-    Credential,
+    ConcreteCrypto,
     DCert,
     DPState,
-    KeyHash,
     KeyPair,
     LEDGER,
     LedgerEnv,
-    PoolParams,
     Tx,
     TxBody,
     TxOut,
@@ -208,10 +217,10 @@ stakeKeys start end = fmap (\w -> mkKeyPair' (w, 0, 0, 0, 0)) [start .. end]
 stakeKeyOne :: KeyPair Blake2b_256 'Staking
 stakeKeyOne = mkKeyPair' (1, 0, 0, 0, 0)
 
-stakeKeyToCred :: KeyPair Blake2b_256 'Staking -> Credential Blake2b_256 'Staking
+stakeKeyToCred :: KeyPair Blake2b_256 'Staking -> Credential 'Staking (ConcreteCrypto Blake2b_256)
 stakeKeyToCred = KeyHashObj . hashKey . vKey
 
-firstStakeKeyCred :: Credential Blake2b_256 'Staking
+firstStakeKeyCred :: Credential 'Staking (ConcreteCrypto Blake2b_256)
 firstStakeKeyCred = stakeKeyToCred stakeKeyOne
 
 -- Create stake key registration certificates
@@ -374,16 +383,16 @@ poolColdKeys start end = fmap (\w -> mkKeyPair' (w, 1, 0, 0, 0)) [start .. end]
 firstStakePool :: KeyPair Blake2b_256 'StakePool
 firstStakePool = mkKeyPair' (1, 1, 0, 0, 0)
 
-mkPoolKeyHash :: KeyPair Blake2b_256 'StakePool -> KeyHash Blake2b_256 'StakePool
+mkPoolKeyHash :: KeyPair Blake2b_256 'StakePool -> KeyHash 'StakePool (ConcreteCrypto Blake2b_256)
 mkPoolKeyHash = hashKey . vKey
 
-firstStakePoolKeyHash :: KeyHash Blake2b_256 'StakePool
+firstStakePoolKeyHash :: KeyHash 'StakePool (ConcreteCrypto Blake2b_256)
 firstStakePoolKeyHash = mkPoolKeyHash firstStakePool
 
 vrfKeyHash :: VRFKeyHash Blake2b_256
 vrfKeyHash = hashKeyVRF . snd . mkVRFKeyPair $ (0, 0, 0, 0, 0)
 
-mkPoolParameters :: KeyPair Blake2b_256 'StakePool -> PoolParams Blake2b_256
+mkPoolParameters :: KeyPair Blake2b_256 'StakePool -> PoolParams (ConcreteCrypto Blake2b_256)
 mkPoolParameters keys =
   PoolParams
     { _poolPubKey = (hashKey . vKey) keys,
@@ -527,3 +536,68 @@ txDelegate n m =
 ledgerDelegateManyKeysOnePool ::
   Word64 -> Word64 -> (UTxOState Blake2b_256, DPState Blake2b_256) -> ()
 ledgerDelegateManyKeysOnePool x y state = testLEDGER state (txDelegate x y) ledgerEnv
+
+data RewardParameters crypto = RewardParameters
+  { ppRP :: PParams,
+    bsRP :: BlocksMade crypto,
+    potRP :: Coin,
+    credsRP :: Set (Credential 'Staking crypto),
+    poolsRP :: Map (KeyHash 'StakePool crypto) (PoolParams crypto),
+    stakeRP :: Stake crypto,
+    delegsRP :: Map (Credential 'Staking crypto) (KeyHash 'StakePool crypto),
+    totRP :: Coin,
+    ascRP :: ActiveSlotCoeff,
+    esRP :: EpochSize
+  }
+
+makeRewardParams ::
+  Word64 ->
+  Word64 ->
+  RewardParameters (ConcreteCrypto Blake2b_256)
+makeRewardParams numStakeCreds numPools =
+  RewardParameters
+    { ppRP = ppsBench,
+      bsRP = BlocksMade Map.empty,
+      potRP = Coin 1000*1000*1000,
+      credsRP = Set.fromList stakeCreds,
+      poolsRP =
+        Map.fromList $
+          map (\k -> (mkPoolKeyHash k, mkPoolParameters k)) poolKeys,
+      -- TODO make interesting pool parameters, ie with non-zero cost, margin, and pledge
+      stakeRP = Stake . Map.fromList $ map (\cred -> (cred, Coin 1000)) stakeCreds,
+      -- TODO make more varied stake distribution
+      delegsRP =
+        Map.fromList $
+          map (\(s, p) -> (s, mkPoolKeyHash p)) $
+            zip stakeCreds (cycle poolKeys),
+      -- TODO this is a very homogenous delegation mapping, maybe we want something more interesting
+      totRP = Coin 1000*1000*1000*1000,
+      ascRP = mkActiveSlotCoeff . unsafeMkUnitInterval $ 0.3,
+      esRP = EpochSize 21600
+    }
+  where
+    stakeCreds = map stakeKeyToCred $ stakeKeys 0 numStakeCreds
+    poolKeys = poolColdKeys 0 numPools
+
+runRewards ::
+  RewardParameters (ConcreteCrypto Blake2b_256) ->
+  ( Map
+      (Credential 'Staking (ConcreteCrypto Blake2b_256))
+      Coin,
+    Map
+      (KeyHash 'StakePool (ConcreteCrypto Blake2b_256))
+      Likelihood
+  )
+runRewards
+  RewardParameters
+    { ppRP,
+      bsRP,
+      potRP,
+      credsRP,
+      poolsRP,
+      stakeRP,
+      delegsRP,
+      totRP,
+      ascRP,
+      esRP
+    } = reward ppRP bsRP potRP credsRP poolsRP stakeRP delegsRP totRP ascRP esRP
