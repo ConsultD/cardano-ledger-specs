@@ -30,6 +30,7 @@ library
                      Shelley.Spec.Ledger.Credential
                      Shelley.Spec.Ledger.Delegation.Certificates
                      Shelley.Spec.Ledger.Delegation.PoolParams
+                     Shelley.Spec.Ledger.DeserializeShort
                      Shelley.Spec.Ledger.EpochBoundary
                      Shelley.Spec.Ledger.Genesis
                      Shelley.Spec.Ledger.Hashing
