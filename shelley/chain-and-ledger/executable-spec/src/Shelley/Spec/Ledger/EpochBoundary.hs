@@ -37,14 +37,14 @@ import qualified Data.Set as Set
 import GHC.Generics (Generic)
 import Numeric.Natural (Natural)
 import Quiet
+import Shelley.Spec.Ledger.Address (Addr (..))
 import Shelley.Spec.Ledger.Coin (Coin (..), coinToRational, rationalToCoinViaFloor)
 import Shelley.Spec.Ledger.Credential (Credential, Ptr, StakeReference (..))
 import Shelley.Spec.Ledger.Crypto
-import Shelley.Spec.Ledger.DeserializeShort (deserialiseAddrStakeRef)
 import Shelley.Spec.Ledger.Keys (KeyHash, KeyRole (..))
 import Shelley.Spec.Ledger.PParams (PParams, PParams' (..), _a0, _nOpt)
 import Shelley.Spec.Ledger.Serialization (decodeRecordNamed)
-import Shelley.Spec.Ledger.TxData (PoolParams, TxOut (TxOutCompact))
+import Shelley.Spec.Ledger.TxData (PoolParams, TxOut (TxOut))
 import Shelley.Spec.Ledger.UTxO (UTxO (..))
 
 -- | Blocks made
@@ -81,12 +81,14 @@ aggregateUtxoCoinByCredential ::
 aggregateUtxoCoinByCredential ptrs (UTxO u) initial =
   Map.foldr accum initial u
   where
-    accum (TxOutCompact addr c) ans = case deserialiseAddrStakeRef addr of
-      Just (StakeRefPtr p) -> case Map.lookup p ptrs of
-        Just cred -> Map.insertWith (+) cred (fromIntegral c) ans
-        Nothing -> ans
-      Just (StakeRefBase hk) -> Map.insertWith (+) hk (fromIntegral c) ans
-      _other -> ans
+    accum (TxOut addr c) ans = case addr of
+      (Addr _ _ sr) -> case sr of
+        StakeRefPtr p -> case Map.lookup p ptrs of
+          Just cred -> Map.insertWith (+) cred c ans
+          Nothing -> ans
+        StakeRefBase hk -> Map.insertWith (+) hk c ans
+        _other -> ans
+      _boot -> ans
 
 -- | Get stake of one pool
 poolStake ::
